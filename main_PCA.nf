@@ -331,18 +331,22 @@ process merge_proj_coords {
 // ----------------------------------------------------------------------------
 process run_pca_analysis {
   tag "run_pca_analysis"
+
   input:
     path pca_file
+    val mode
+
   output:
     path "*"
+
   publishDir "results/PCA_plots", mode: "copy"
+
   script:
   """
   module load r
   mkdir -p plot_PCA
 
-  # Because PCA.R is in bin/, Nextflow puts it on PATH; call it directly
-  Rscript PCA.R ${pca_file} ${params.meta_file} ${params.qc_study_list} ${params.k} ${params.n_pcs} ${params.threshold_N}
+  Rscript PCA.R ${pca_file} ${params.meta_file} ${params.qc_study_list} ${mode} ${params.k} ${params.n_pcs} ${params.threshold_N}
   """
 }
 
@@ -388,28 +392,38 @@ workflow {
     // Concatenate all pruned VCFs (collect into a list of paths)
     def concat_results = concat_pruned_vcfs( pruned_all.map { it[1] }.collect() )
 
-    // Double ID lists + split study list into batches
-    def ref_ids   = double_ref_ids(qc_ref_list_ch)
-    def study_ids = double_study_ids(qc_study_list_ch)
-    def study_batches = split_study_list(study_ids).flatMap { it }
-
+    // Double reference IDs
+    def ref_ids = double_ref_ids(qc_ref_list_ch)
+    
     // Prepare reference (VCF → geno/site → PCA)
     def ( ref_vcf, ref_tbi, ref_geno, ref_site, ref_pca ) = prepare_reference(concat_results, ref_ids)
-
-    // Build combined input tuples for projection (batch × reference)
-    def proj_input = study_batches
-                      .combine(concat_results)
-                      .combine(ref_geno)
-                      .combine(ref_site)
-                      .combine(ref_pca)
-                      .map { it -> tuple(it[0], it[1], it[2], it[3], it[4]) }
-
-    // Project each batch in parallel
-    def projected = laser_pca_projection_batch(proj_input)
-
-    // Merge all projections with the reference PCs
-    def final_pca = merge_proj_coords(ref_pca, projected.collect())
-
-    // Generate plots
-    run_pca_analysis(final_pca)
+    
+    if (params.run_projection) {
+    
+        // Double and split study IDs only when projection is requested
+        def study_ids = double_study_ids(qc_study_list_ch)
+        def study_batches = split_study_list(study_ids).flatMap { it }
+    
+        // Build combined input tuples for projection
+        def proj_input = study_batches
+                          .combine(concat_results)
+                          .combine(ref_geno)
+                          .combine(ref_site)
+                          .combine(ref_pca)
+                          .map { it -> tuple(it[0], it[1], it[2], it[3], it[4]) }
+    
+        // Project each batch
+        def projected = laser_pca_projection_batch(proj_input)
+    
+        // Merge reference PCA + projected samples
+        def final_pca = merge_proj_coords(ref_pca, projected.collect())
+    
+        // Plot merged PCA
+        run_pca_analysis(final_pca, "projection")
+    
+    } else {
+    
+        // Plot reference PCA only
+        run_pca_analysis(ref_pca, "reference_only")
+    }
 }

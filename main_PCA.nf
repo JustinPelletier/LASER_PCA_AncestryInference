@@ -40,7 +40,7 @@ process qc_norm_ref {
     module load bcftools
 
     bcftools norm -m -both -f "${params.ref_fasta}" "$vcf" | \
-      bcftools view -f PASS -q 0.05 -Q 0.95 | \
+      bcftools view -q 0.05 -Q 0.95 | \
       bcftools annotate -x INFO,^GT | \
       bcftools view -S "${params.qc_ref_list}" --force-samples | \
       bcftools annotate --set-id '%CHROM:%POS:%REF:%ALT' -Oz -o ref_${chr}.qc.vcf.gz
@@ -77,10 +77,13 @@ process qc_norm_study {
 // ----------------------------------------------------------------------------
 process intersect {
   tag "$chr"
+
   input:
     tuple val(chr), path(ref), path(ref_tbi), path(study), path(study_tbi)
+
   output:
     tuple val(chr), path("${chr}.merged.vcf.gz"), path("${chr}.merged.vcf.gz.tbi")
+
   script:
   """
   module load bcftools
@@ -89,8 +92,17 @@ process intersect {
   tmp=\$(mktemp -d)
   trap 'rm -rf "\$tmp"' EXIT
 
-  bcftools isec -n=2 -p "\$tmp" -Oz "$ref" "$study"
-  bcftools merge -m all -Oz -o "${chr}.merged.vcf.gz" "\$tmp/0000.vcf.gz" "\$tmp/0001.vcf.gz"
+  # Exact shared variants from reference and study
+  bcftools isec -n=2 -c none -w1 -Oz -o "\$tmp/shared_ref.vcf.gz" "$ref" "$study"
+  bcftools isec -n=2 -c none -w2 -Oz -o "\$tmp/shared_study.vcf.gz" "$ref" "$study"
+
+  tabix -f "\$tmp/shared_ref.vcf.gz"
+  tabix -f "\$tmp/shared_study.vcf.gz"
+
+  bcftools merge -m none -Oz -o "${chr}.merged.vcf.gz" \
+    "\$tmp/shared_ref.vcf.gz" \
+    "\$tmp/shared_study.vcf.gz"
+
   tabix -f "${chr}.merged.vcf.gz"
   """
 }
@@ -106,7 +118,7 @@ process final_qc_and_prune {
     tuple val(chr), path("${chr}.pruned.vcf.gz"), path("${chr}.pruned.vcf.gz.tbi")
   script:
   """
-  module load plink/1.9 bcftools
+  module load StdEnv/2020 plink/1.9b_6.21-x86_64 bcftools
 
   # Prepare low-complexity BED (drop header if present; keep first 3 cols)
   if [ "${params.header_bed}" = "TRUE" ]; then
@@ -360,75 +372,94 @@ process run_pca_analysis {
 // ============================================================================
 workflow {
 
-    // Build per-chromosome tuples for autosomes 1..22 from input globs
+    // Reference chromosomes
     def ref_ch = Channel.fromPath(params.input_reference, checkIfExists: true)
-                        .map { f ->
-                          def m = (f.name =~ /chr(\d+)/)
-                          if (m) {
-                            def c = m[0][1] as Integer
-                            if (c >= 1 && c <= 22) tuple(c.toString(), f, file(f.toString() + '.tbi'))
-                          }
-                        }
-                        .filter { it != null }
+        .map { f ->
+            def m = (f.name =~ /chr(\d+)/)
+            if (m) {
+                def c = m[0][1] as Integer
+                if (c >= 1 && c <= 22) tuple(c.toString(), f, file(f.toString() + '.tbi'))
+            }
+        }
+        .filter { it != null }
 
-    def study_ch = Channel.fromPath(params.input_study, checkIfExists: true)
-                          .map { f ->
-                            def m = (f.name =~ /chr(\d+)/)
-                            if (m) {
-                              def c = m[0][1] as Integer
-                              if (c >= 1 && c <= 22) tuple(c.toString(), f, file(f.toString() + '.tbi'))
-                            }
-                          }
-                          .filter { it != null }
+    // Reference sample list
+    def qc_ref_list_ch = Channel.fromPath(params.qc_ref_list, checkIfExists: true)
 
-    // Parameter files as channels
-    def qc_ref_list_ch   = Channel.fromPath(params.qc_ref_list)
-    def qc_study_list_ch = Channel.fromPath(params.qc_study_list)
+    // QC reference
+    def ref_qc = qc_norm_ref(ref_ch)
 
-    // Normalize/QC both panels
-    def ref_qc   = qc_norm_ref(ref_ch)
-    def study_qc = qc_norm_study(study_ch)
+    def pca_input_vcf
 
-    // Join by chr → intersect → QC+prune
-    def ref_study_joined = ref_qc.join(study_qc)
-    def intersect_results = intersect(ref_study_joined)
-    def pruned_all = final_qc_and_prune(intersect_results)
+    if (params.run_projection) {
 
-    // Concatenate all pruned VCFs (collect into a list of paths)
-    def concat_results = concat_pruned_vcfs( pruned_all.map { it[1] }.collect() )
+        if (!params.input_study || !params.qc_study_list) {
+            error "When --run_projection true, you must provide --input_study and --qc_study_list"
+        }
+
+        def study_ch = Channel.fromPath(params.input_study, checkIfExists: true)
+            .map { f ->
+                def m = (f.name =~ /chr(\d+)/)
+                if (m) {
+                    def c = m[0][1] as Integer
+                    if (c >= 1 && c <= 22) tuple(c.toString(), f, file(f.toString() + '.tbi'))
+                }
+            }
+            .filter { it != null }
+
+        def qc_study_list_ch = Channel.fromPath(params.qc_study_list, checkIfExists: true)
+
+        // QC study
+        def study_qc = qc_norm_study(study_ch)
+
+        // Reference ∩ study variants
+        def ref_study_joined = ref_qc.join(study_qc)
+        def intersect_results = intersect(ref_study_joined)
+
+        // Final QC/pruning on shared reference + study VCF
+        pca_input_vcf = intersect_results
+
+    } else {
+
+        // Reference-only mode:
+        // skip study QC, skip intersection, prune reference directly
+        pca_input_vcf = ref_qc
+    }
+
+    // Final QC + LD pruning
+    def pruned_all = final_qc_and_prune(pca_input_vcf)
+
+    // Concatenate pruned chromosomes
+    def concat_results = concat_pruned_vcfs(pruned_all.map { it[1] }.collect())
 
     // Double reference IDs
     def ref_ids = double_ref_ids(qc_ref_list_ch)
-    
-    // Prepare reference (VCF → geno/site → PCA)
-    def ( ref_vcf, ref_tbi, ref_geno, ref_site, ref_pca ) = prepare_reference(concat_results, ref_ids)
-    
+
+    // Prepare reference PCA
+    def (ref_vcf, ref_tbi, ref_geno, ref_site, ref_pca) = prepare_reference(concat_results, ref_ids)
+
     if (params.run_projection) {
-    
-        // Double and split study IDs only when projection is requested
+
+        def qc_study_list_ch = Channel.fromPath(params.qc_study_list, checkIfExists: true)
+
         def study_ids = double_study_ids(qc_study_list_ch)
         def study_batches = split_study_list(study_ids).flatMap { it }
-    
-        // Build combined input tuples for projection
+
         def proj_input = study_batches
-                          .combine(concat_results)
-                          .combine(ref_geno)
-                          .combine(ref_site)
-                          .combine(ref_pca)
-                          .map { it -> tuple(it[0], it[1], it[2], it[3], it[4]) }
-    
-        // Project each batch
+            .combine(concat_results)
+            .combine(ref_geno)
+            .combine(ref_site)
+            .combine(ref_pca)
+            .map { it -> tuple(it[0], it[1], it[2], it[3], it[4]) }
+
         def projected = laser_pca_projection_batch(proj_input)
-    
-        // Merge reference PCA + projected samples
+
         def final_pca = merge_proj_coords(ref_pca, projected.collect())
-    
-        // Plot merged PCA
+
         run_pca_analysis(final_pca, "projection")
-    
+
     } else {
-    
-        // Plot reference PCA only
+
         run_pca_analysis(ref_pca, "reference_only")
     }
 }

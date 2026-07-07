@@ -208,16 +208,19 @@ process split_study_list {
 // ----------------------------------------------------------------------------
 process prepare_reference {
   tag "prepare_reference"
+  publishDir "${params.outdir}", mode: "copy"
+
   input:
     path vcf
     path ref_list
+
   output:
     path "reference_pruned.vcf.gz"
     path "reference_pruned.vcf.gz.tbi"
     path "reference_pruned.geno"
     path "reference_pruned.site"
     path "reference.RefPC.coord"
-  publishDir "${params.outdir}", mode: "copy"
+
   script:
   """
   module load bcftools
@@ -284,12 +287,14 @@ EOF
 //     (writes a trimmed coord file + a full concat)
 // ----------------------------------------------------------------------------
 process merge_proj_coords {
+  publishDir "${params.outdir}", mode: "copy"
+
   input:
     path ref_pca
     path proj_files
   output:
     path "final.ProPC.coord"
-  publishDir "${params.outdir}", mode: "copy"
+
   script:
   """
   # 1) Start with cleaned reference PCA (keep IDs + PC columns)
@@ -331,6 +336,7 @@ process merge_proj_coords {
 // ----------------------------------------------------------------------------
 process run_pca_analysis {
   tag "run_pca_analysis"
+  publishDir "results/PCA_plots", mode: "copy"
 
   input:
     path pca_file
@@ -339,7 +345,6 @@ process run_pca_analysis {
   output:
     path "*"
 
-  publishDir "results/PCA_plots", mode: "copy"
 
   script:
   """
